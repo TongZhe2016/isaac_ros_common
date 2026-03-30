@@ -1,0 +1,31 @@
+# OmniStereo-style dev environment: Miniforge + conda env "FD" (Python 3.11) + torch + requirements.
+# Only small files from docker/omnistereo/ are copied (no OmniStereo repo).
+#
+# Enable: set CONFIG_IMAGE_KEY=ros2_humble.omnistereo in ~/.isaac_ros_common-config
+# (or pass -i ros2_humble.omnistereo to build_image_layers.sh). run_dev.sh will use
+# image key aarch64.ros2_humble.omnistereo on Jetson / amd64.ros2_humble.omnistereo on x86.
+#
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG PLATFORM=arm64
+ENV PLATFORM=${PLATFORM}
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
+
+# Extra build deps: OpenEXR, flash-attn, PyTables (tables) from sdist needs HDF5 headers
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        libhdf5-dev \
+        pkg-config \
+        libopenexr-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY omnistereo/conda-requirements.txt /tmp/conda-requirements.txt
+COPY omnistereo/install_miniforge_conda.sh /tmp/install_miniforge_conda.sh
+RUN chmod +x /tmp/install_miniforge_conda.sh && /tmp/install_miniforge_conda.sh && rm -f /tmp/install_miniforge_conda.sh
+
+ENV PATH="/opt/miniforge3/bin:${PATH}"

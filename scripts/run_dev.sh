@@ -1,3 +1,5 @@
+CONFIG_IMAGE_KEY=ros2_humble.omnistereo
+
 #!/bin/bash
 #
 # Copyright (c) 2021-2024, NVIDIA CORPORATION.  All rights reserved.
