@@ -1,6 +1,6 @@
-CONFIG_IMAGE_KEY=ros2_humble.omnistereo
-
 #!/bin/bash
+# Optional: override in ~/.isaac_ros_common-config instead of editing this file
+CONFIG_IMAGE_KEY=ros2_humble.omnistereo
 #
 # Copyright (c) 2021-2024, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -184,18 +184,36 @@ if [[ ! -z "$CONFIG_CONTAINER_NAME_SUFFIX" ]] ; then
 fi
 CONTAINER_NAME="$BASE_NAME-container"
 
-# Remove any exited containers.
-if [ "$(docker ps -a --quiet --filter status=exited --filter name=$CONTAINER_NAME)" ]; then
-    docker rm $CONTAINER_NAME > /dev/null
-fi
-
-# Re-use existing container.
+# Re-use running container.
 if [ "$(docker ps -a --quiet --filter status=running --filter name=$CONTAINER_NAME)" ]; then
     print_info "Attaching to running container: $CONTAINER_NAME"
     ISAAC_ROS_WS=$(docker exec $CONTAINER_NAME printenv ISAAC_ROS_WS)
     print_info "Docker workspace: $ISAAC_ROS_WS"
-    docker exec -i -t -u admin --workdir $ISAAC_ROS_WS $CONTAINER_NAME /bin/bash $@
+    docker exec -e IGNOREEOF=2 -i -t -u admin --workdir $ISAAC_ROS_WS $CONTAINER_NAME /bin/bash $@
     exit 0
+fi
+
+# Start stopped container (kept after exit; survives host reboot with --restart unless-stopped).
+if docker inspect "$CONTAINER_NAME" &>/dev/null; then
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" != "true" ]; then
+        print_info "Starting stopped container: $CONTAINER_NAME"
+        docker start "$CONTAINER_NAME"
+        ISAAC_ROS_WS=""
+        for _i in $(seq 1 60); do
+            ISAAC_ROS_WS=$(docker exec "$CONTAINER_NAME" printenv ISAAC_ROS_WS 2>/dev/null) || true
+            if [[ -n "$ISAAC_ROS_WS" ]]; then
+                break
+            fi
+            sleep 1
+        done
+        if [[ -z "$ISAAC_ROS_WS" ]]; then
+            print_error "Container $CONTAINER_NAME did not become ready after docker start."
+            exit 1
+        fi
+        print_info "Docker workspace: $ISAAC_ROS_WS"
+        docker exec -e IGNOREEOF=2 -i -t -u admin --workdir $ISAAC_ROS_WS $CONTAINER_NAME /bin/bash $@
+        exit 0
+    fi
 fi
 
 # Summarize launch
@@ -223,10 +241,21 @@ if [[ -z $(docker image ls --quiet $BASE_NAME) ]]; then
     exit 1
 fi
 
-# Map host's display socket to docker
+# Map host X11 for GUI (rviz, etc.): socket, auth cookie, and DISPLAY
 DOCKER_ARGS+=("-v /tmp/.X11-unix:/tmp/.X11-unix")
-DOCKER_ARGS+=("-v $HOME/.Xauthority:/home/admin/.Xauthority:rw")
+# gdm/wayland sessions often set XAUTHORITY to something other than ~/.Xauthority
+HOST_XAUTH_FILE="${XAUTHORITY:-$HOME/.Xauthority}"
+if [[ -f "$HOST_XAUTH_FILE" ]]; then
+    DOCKER_ARGS+=("-v $HOST_XAUTH_FILE:/home/admin/.Xauthority:rw")
+else
+    print_warning "No X11 cookie at $HOST_XAUTH_FILE — GUIs may fail. Use a local graphical login or set XAUTHORITY to your display's cookie file."
+fi
 DOCKER_ARGS+=("-e DISPLAY")
+DOCKER_ARGS+=("-e XAUTHORITY=/home/admin/.Xauthority")
+# Avoid MIT-SHM failures inside some containers (blank/black toolkits)
+DOCKER_ARGS+=("-e QT_X11_NO_MITSHM=1")
+# Require multiple consecutive Ctrl+D to exit shell (reduces accidental container exit)
+DOCKER_ARGS+=("-e IGNOREEOF=2")
 DOCKER_ARGS+=("-e NVIDIA_VISIBLE_DEVICES=all")
 DOCKER_ARGS+=("-e NVIDIA_DRIVER_CAPABILITIES=all")
 DOCKER_ARGS+=("-e ROS_DOMAIN_ID")
@@ -255,6 +284,13 @@ if [[ $PLATFORM == "aarch64" ]]; then
     if [[ $(getent group jtop) ]]; then
         DOCKER_ARGS+=("-v /run/jtop.sock:/run/jtop.sock:ro")
     fi
+
+    # GPU DRI for OpenGL/EGL GUIs (Jetson)
+    if [[ -d /dev/dri ]]; then
+        for _dri in /dev/dri/*; do
+            [[ -e "$_dri" ]] && DOCKER_ARGS+=("--device=$_dri")
+        done
+    fi
 fi
 
 # Optionally load custom docker arguments from file
@@ -277,12 +313,22 @@ if [[ -f "${DOCKER_ARGS_FILEPATH}" ]]; then
     done
 fi
 
+# Allow the container user to connect to the host X server (needed on many setups)
+if command -v xhost &>/dev/null; then
+    xhost +local:docker 2>/dev/null || xhost +local:root 2>/dev/null || xhost +local: 2>/dev/null || true
+fi
+
+# Run container: no --rm; --restart unless-stopped for auto-start after host reboot.
+# Main process is sleep infinity (detached) so exiting the interactive shell does not trigger a restart loop.
+# Fully stop the container on the host with: docker stop $CONTAINER_NAME
+# Remove the container with: docker rm -f $CONTAINER_NAME
+
 # Run container from image
-print_info "Running $CONTAINER_NAME"
+print_info "Running $CONTAINER_NAME (persistent; restarts after reboot unless you: docker stop $CONTAINER_NAME)"
 if [[ $VERBOSE -eq 1 ]]; then
     set -x
 fi
-docker run -it --rm \
+docker run -d --restart unless-stopped \
     --privileged \
     --network host \
     --ipc=host \
@@ -294,4 +340,19 @@ docker run -it --rm \
     --entrypoint /usr/local/bin/scripts/workspace-entrypoint.sh \
     --workdir /workspaces/isaac_ros-dev \
     $BASE_NAME \
-    /bin/bash
+    /bin/bash -c 'exec sleep infinity'
+
+ISAAC_ROS_WS=""
+for _i in $(seq 1 60); do
+    ISAAC_ROS_WS=$(docker exec "$CONTAINER_NAME" printenv ISAAC_ROS_WS 2>/dev/null) || true
+    if [[ -n "$ISAAC_ROS_WS" ]]; then
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$ISAAC_ROS_WS" ]]; then
+    print_error "Container $CONTAINER_NAME did not become ready in time."
+    exit 1
+fi
+print_info "Docker workspace: $ISAAC_ROS_WS"
+docker exec -e IGNOREEOF=2 -i -t -u admin --workdir $ISAAC_ROS_WS $CONTAINER_NAME /bin/bash $@
